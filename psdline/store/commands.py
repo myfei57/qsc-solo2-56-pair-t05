@@ -21,6 +21,7 @@ class DoorCommand:
     kind: str
     epoch: int
     station_id: str = ""
+    kid: str = ""
 
     def as_dict(self) -> dict:
         return {
@@ -29,6 +30,7 @@ class DoorCommand:
             "kind": self.kind,
             "epoch": self.epoch,
             "station_id": self.station_id,
+            "kid": self.kid,
         }
 
     @classmethod
@@ -39,6 +41,7 @@ class DoorCommand:
             kind=str(payload.get("kind", "")),
             epoch=int(payload.get("epoch", 0)),
             station_id=str(payload.get("station_id", "")),
+            kid=str(payload.get("kid", "")),
         )
 
 
@@ -85,6 +88,19 @@ class CommandLog:
         self._store.remove(self._doc_id(train_id))
         self._epoch += 1
         return removed
+
+    def retract(self, train_id: str, command_id: str) -> bool:
+        """从队列里撤下一条指令（执行链回滚用），返回是否真的撤掉了。"""
+
+        queued = self.pending(train_id)
+        kept = [command for command in queued if command.id != command_id]
+        if len(kept) == len(queued):
+            return False
+        if kept:
+            self._store.write(self._doc_id(train_id), [item.as_dict() for item in kept])
+        else:
+            self._store.remove(self._doc_id(train_id))
+        return True
 
     def total_queued(self) -> int:
         """统计全部列车排队中的指令条数。"""

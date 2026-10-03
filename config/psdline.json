@@ -47,6 +47,11 @@
   "audit": {
     "journal_segment": 512
   },
+  "sec": {
+    "command_ttl_s": 30.0,
+    "rotation_grace_s": 300.0,
+    "clock_skew_s": 5.0
+  },
   "console": {
     "host": "127.0.0.1",
     "port": 8080

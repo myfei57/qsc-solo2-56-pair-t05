@@ -70,9 +70,9 @@ def test_batch_open_respects_order_and_limit(platform):
     assert platform.gates.by_station("ST1")[0].open is True
 
 
-def test_batch_open_skips_locked_groups(platform):
+def test_batch_open_skips_locked_groups(platform, sign):
     gate = platform.gates.by_station("ST1")[0]
-    platform.set_fault(gate.id)
+    sign("interlock.set_fault", psd_id=gate.id)
     outcome = batch_open(platform.doors, "ST1", list(platform.layouts.get("ST1").zones))
     assert outcome["skipped"][gate.group] == "locked"
 

@@ -103,6 +103,20 @@ class AuditSection:
 
 
 @dataclass(frozen=True)
+class SecSection:
+    """指令防伪限值。
+
+    ``command_ttl_s``     指令默认／最长有效期（秒），过期指令一律拒收；
+    ``rotation_grace_s``  密钥轮换后旧密钥继续可验的宽限期（秒），0 表示硬切换；
+    ``clock_skew_s``      容忍的签发时间前倾（秒）。
+    """
+
+    command_ttl_s: float = 30.0
+    rotation_grace_s: float = 300.0
+    clock_skew_s: float = 5.0
+
+
+@dataclass(frozen=True)
 class ConsoleSection:
     """控制台监听地址。"""
 
@@ -124,6 +138,7 @@ class PlatformConfig:
     interlock: InterlockSection = field(default_factory=InterlockSection)
     quota: QuotaSection = field(default_factory=QuotaSection)
     audit: AuditSection = field(default_factory=AuditSection)
+    sec: SecSection = field(default_factory=SecSection)
     console: ConsoleSection = field(default_factory=ConsoleSection)
 
     @property
@@ -169,6 +184,16 @@ class PlatformConfig:
             raise ConfigError("运行配额必须为正", component="config")
         if self.audit.journal_segment <= 0:
             raise ConfigError("审计分段长度必须为正", component="config")
+        if self.sec.command_ttl_s <= 0:
+            raise ConfigError("指令有效期必须为正", component="config")
+        if self.sec.clock_skew_s < 0:
+            raise ConfigError("签发时间前倾容忍不能为负", component="config")
+        if self.sec.rotation_grace_s < 0:
+            raise ConfigError("密钥轮换宽限期不能为负", component="config")
+        if 0 < self.sec.rotation_grace_s < self.sec.command_ttl_s:
+            raise ConfigError(
+                "密钥轮换宽限期必须覆盖指令有效期（或置 0 表示硬切换）", component="config"
+            )
         if not 0 < self.console.port <= 65535:
             raise ConfigError("控制台端口必须落在 1..65535", component="config")
         return self
@@ -213,6 +238,7 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "interlock": dict(config.interlock.__dict__),
         "quota": dict(config.quota.__dict__),
         "audit": dict(config.audit.__dict__),
+        "sec": dict(config.sec.__dict__),
         "console": dict(config.console.__dict__),
     }
 
@@ -233,6 +259,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         interlock=_section(InterlockSection, payload.get("interlock")),
         quota=_section(QuotaSection, payload.get("quota")),
         audit=_section(AuditSection, payload.get("audit")),
+        sec=_section(SecSection, payload.get("sec")),
         console=_section(ConsoleSection, payload.get("console")),
     )
     return config.validate()

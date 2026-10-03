@@ -1,13 +1,15 @@
 """命令行入口。
 
-五个子命令覆盖日常使用：
+七个子命令覆盖日常使用：
 
 ``serve``   启动控制台 HTTP 服务，可选地在启动后探测接口；
-``demo``    在本地跑一遍完整流程（到站开门 → 间隙探测 → 发车 → 批量开门 →
-            门区联动 → 故障置位与解除 → 序号回绕 → 控制周期 → 清扫），用于交付
-            前的真实运行检查；
+``demo``    在本地跑一遍完整流程（到站开门 → 间隙探测 → 签名指令入队 → 发车 →
+            批量开门 → 门区联动 → 故障置位与解除 → 密钥轮换 → 序号回绕 → 控制
+            周期 → 清扫），用于交付前的真实运行检查；
 ``status``  打印当前状态快照；
 ``config``  打印生效配置；
+``sign``    用当前主密钥签一条指令信封（输出可直接 POST 到 /api/commands）；
+``rotate``  轮换指令签名密钥（旧钥进入宽限期，只验不签）；
 ``reset``   清掉落盘的平台计数。
 """
 
@@ -73,16 +75,35 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     arrival = platform.arrive(args.train, args.station, 0)
     position = platform.refresh_position(args.train, 12)
     gap = platform.check_gap(args.train)
-    queued = platform.enqueue(args.train, "cmd-1", "open", args.station)
+    queued = platform.submit_command(
+        platform.sign_command(
+            "door.enqueue", {"train_id": args.train, "kind": "open", "station_id": args.station}
+        )
+    )
     processed = platform.process_queue(args.train)
     swept = platform.sweep(args.station)
-    fault = platform.set_fault(_first_gate(platform, args.station))
-    cleared = platform.clear_fault(_first_gate(platform, args.station))
-    batched = platform.batch_open(args.station)
+    fault = platform.submit_command(
+        platform.sign_command("interlock.set_fault", {"psd_id": _first_gate(platform, args.station)})
+    )
+    cleared = platform.submit_command(
+        platform.sign_command(
+            "interlock.clear_fault", {"psd_id": _first_gate(platform, args.station)}
+        )
+    )
+    batched = platform.submit_command(
+        platform.sign_command("door.batch_open", {"station_id": args.station})
+    )
     renumber = platform.renumber(args.station, _mirror_mapping(platform, args.station))
     sequence = platform.sequence_verdict(65534, 4)
     dwell = platform.register_dwell(args.train, 45.0, args.station)
     route = platform.assign_route(args.train, args.station, _next_station(platform, args.station), 1200)
+    rotation = platform.rotate_keys()
+    # 轮换后再签一条，验证新钥立即可用、旧流程不断。
+    post_rotation = platform.submit_command(
+        platform.sign_command(
+            "door.enqueue", {"train_id": args.train, "kind": "close", "station_id": args.station}
+        )
+    )
     departure = platform.depart(args.train, args.station)
     cycles = [platform.cycle(dt=args.dt) for _ in range(args.cycles)]
     final_sweep = platform.sweep(args.station)
@@ -109,6 +130,8 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "sequence": sequence,
         "dwell": dwell,
         "route": route,
+        "rotation": rotation,
+        "post_rotation": {key: post_rotation[key] for key in ("ok", "train_id", "command_id")},
         "departure": departure,
         "cycles_run": len(cycles),
         "last_cycle": cycles[-1],
@@ -121,10 +144,14 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     failures = [name for name, item in probe.items() if not item["ok"]]
     for name, operation in (
         ("arrival", arrival),
+        ("queued", queued),
         ("processed", processed),
         ("renumber", renumber),
+        ("fault", fault),
         ("cleared", cleared),
         ("sequence", sequence),
+        ("rotation", rotation),
+        ("post_rotation", post_rotation),
         ("departure", departure),
     ):
         if not operation.get("ok"):
@@ -182,6 +209,24 @@ def _cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_sign(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    try:
+        payload = json.loads(args.payload)
+    except json.JSONDecodeError as error:
+        raise RailError(f"载荷不是合法 JSON: {error}", component="cli") from error
+    if not isinstance(payload, dict):
+        raise RailError("载荷必须是 JSON 对象", component="cli")
+    _dump(platform.sign_command(args.kind, payload, ttl_s=args.ttl or None))
+    return 0
+
+
+def _cmd_rotate(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    _dump(platform.rotate_keys())
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行解析器。"""
 
@@ -216,6 +261,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     reset = sub.add_parser("reset", help="清掉落盘的平台计数", parents=[common])
     reset.set_defaults(func=_cmd_reset)
+
+    sign = sub.add_parser("sign", help="用当前主密钥签一条指令信封", parents=[common])
+    sign.add_argument("--kind", required=True, help="指令类型，如 door.enqueue")
+    sign.add_argument("--payload", default="{}", help="指令载荷（JSON 对象）")
+    sign.add_argument("--ttl", type=float, default=0.0, help="有效期秒数，0 表示用配置默认")
+    sign.set_defaults(func=_cmd_sign)
+
+    rotate = sub.add_parser("rotate", help="轮换指令签名密钥", parents=[common])
+    rotate.set_defaults(func=_cmd_rotate)
     return parser
 
 

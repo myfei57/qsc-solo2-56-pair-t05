@@ -72,16 +72,34 @@ def test_api_action_flow(platform):
     assert status == 200 and arrival["ok"] is True
     status, gap = api.handle("POST", "/api/gap", {}, {"train_id": "T01"})
     assert status == 200 and gap["clear"] is True
-    status, queued = api.handle(
-        "POST", "/api/enqueue", {}, {"train_id": "T01", "id": "c1", "kind": "open", "station_id": "ST1"}
+    envelope = platform.sign_command(
+        "door.enqueue", {"train_id": "T01", "kind": "open", "station_id": "ST1"}
     )
-    assert status == 200
+    status, queued = api.handle("POST", "/api/commands", {}, envelope)
+    assert status == 200 and queued["ok"] is True
     status, processed = api.handle("POST", "/api/process", {}, {"train_id": "T01"})
-    assert status == 200 and processed["ids"] == ["c1"] and processed["ready"] is False
+    assert status == 200 and processed["ids"] == [envelope["id"]] and processed["ready"] is False
     status, departure = api.handle(
         "POST", "/api/depart", {}, {"train_id": "T01", "station_id": "ST1"}
     )
     assert status == 200 and departure["ok"] is True
+
+
+def test_api_unsigned_command_paths_are_gone(platform):
+    api = Api(platform)
+    for path in ("/api/enqueue", "/api/batch-open", "/api/fault", "/api/clear-fault", "/api/arm"):
+        status, payload = api.handle("POST", path, {}, {})
+        assert status == 404, path
+    envelope = platform.sign_command("door.enqueue", {"train_id": "T01", "kind": "open"})
+    envelope["payload"]["kind"] = "close"  # 篡改载荷，签名必然失效
+    status, rejected = api.handle("POST", "/api/commands", {}, envelope)
+    assert status == 200
+    assert rejected["ok"] is False
+    assert rejected["verdict"]["reason"] == "bad_signature"
+    status, sec = api.handle("GET", "/api/sec", {}, {})
+    assert status == 200 and sec["gate"]["rejected"] == 1
+    status, rotated = api.handle("POST", "/api/sec/rotate", {}, {})
+    assert status == 200 and rotated["ok"] is True and rotated["new_kid"]
 
 
 def test_api_rejects_missing_and_bad_fields(platform):

@@ -27,6 +27,16 @@ def platform(tmp_path, clock) -> Platform:
 
 
 @pytest.fixture()
+def sign(platform):
+    """签一条指令并提交到防伪闸门，返回执行结果。"""
+
+    def _sign(command_kind: str, **payload) -> dict:
+        return platform.submit_command(platform.sign_command(command_kind, payload))
+
+    return _sign
+
+
+@pytest.fixture()
 def online(platform) -> Platform:
     """已到站、已开门、已确认间隙的平台。"""
 

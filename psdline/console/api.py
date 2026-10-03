@@ -74,16 +74,14 @@ class Api:
         add("GET", "/api/mapping/{stationID}", self._mapping)
         add("GET", "/api/resolve", self._resolve)
         add("GET", "/api/readiness", self._readiness)
+        add("GET", "/api/sec", lambda params, body: self._platform.sec_status())
+        add("POST", "/api/sec/rotate", self._rotate_keys)
+        add("POST", "/api/commands", self._submit_command)
         add("POST", "/api/arrive", self._arrive)
         add("POST", "/api/depart", self._depart)
         add("POST", "/api/gap", self._gap)
-        add("POST", "/api/enqueue", self._enqueue)
         add("POST", "/api/process", self._process)
         add("POST", "/api/renumber", self._renumber)
-        add("POST", "/api/batch-open", self._batch_open)
-        add("POST", "/api/fault", self._fault)
-        add("POST", "/api/clear-fault", self._clear_fault)
-        add("POST", "/api/arm", self._arm)
         add("POST", "/api/position", self._position)
         add("POST", "/api/sequence", self._sequence)
         add("POST", "/api/cycle", self._cycle)
@@ -187,6 +185,13 @@ class Api:
 
     # ---- 动作 ---------------------------------------------------------
 
+    def _submit_command(self, params: dict, body: dict) -> dict:
+        # 门控／联锁指令的唯一入口：请求体即签名信封，先验签再执行。
+        return self._platform.submit_command(body)
+
+    def _rotate_keys(self, params: dict, body: dict) -> dict:
+        return self._platform.rotate_keys()
+
     def _arrive(self, params: dict, body: dict) -> dict:
         return self._platform.arrive(
             _require(body, "train_id"),
@@ -200,14 +205,6 @@ class Api:
     def _gap(self, params: dict, body: dict) -> dict:
         return self._platform.check_gap(_require(body, "train_id"), bool(body.get("clear", True)))
 
-    def _enqueue(self, params: dict, body: dict) -> dict:
-        return self._platform.enqueue(
-            _require(body, "train_id"),
-            _require(body, "id"),
-            str(body.get("kind", "open")),
-            str(body.get("station_id", "")),
-        )
-
     def _process(self, params: dict, body: dict) -> dict:
         return self._platform.process_queue(_require(body, "train_id"))
 
@@ -218,18 +215,6 @@ class Api:
         return self._platform.renumber(
             _require(body, "station_id"), {str(k): str(v) for k, v in groups.items()}
         )
-
-    def _batch_open(self, params: dict, body: dict) -> dict:
-        return self._platform.batch_open(_require(body, "station_id"))
-
-    def _fault(self, params: dict, body: dict) -> dict:
-        return self._platform.set_fault(_require(body, "psd_id"))
-
-    def _clear_fault(self, params: dict, body: dict) -> dict:
-        return self._platform.clear_fault(_require(body, "psd_id"))
-
-    def _arm(self, params: dict, body: dict) -> dict:
-        return self._platform.arm(_require(body, "train_id"), bool(body.get("armed", True)))
 
     def _position(self, params: dict, body: dict) -> dict:
         return self._platform.refresh_position(

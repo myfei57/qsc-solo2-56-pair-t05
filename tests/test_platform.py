@@ -55,12 +55,12 @@ def test_renumber_links_new_group(platform):
     assert platform.station_view("ST1")["active_group"] == "G02"
 
 
-def test_fault_locks_gate_and_clear_releases(platform):
+def test_fault_locks_gate_and_clear_releases(platform, sign):
     gate = platform.gates.by_station("ST1")[0]
-    fault = platform.set_fault(gate.id)
+    fault = sign("interlock.set_fault", psd_id=gate.id)
     assert fault["locked"] is True
     assert platform.lockouts.is_locked(gate.id) is True
-    cleared = platform.clear_fault(gate.id)
+    cleared = sign("interlock.clear_fault", psd_id=gate.id)
     assert cleared["ok"] is True
     assert platform.lockouts.is_locked(gate.id) is False
 
@@ -82,8 +82,8 @@ def test_refresh_position_rejects_out_of_range(platform):
     assert rejected["violations"]
 
 
-def test_batch_open_and_sweep(platform):
-    batch = platform.batch_open("ST1")
+def test_batch_open_and_sweep(platform, sign):
+    batch = sign("door.batch_open", station_id="ST1")
     assert batch["ok"] is True
     assert batch["order"][0] == "G01"
     assert batch["nearest"] == "G01"
@@ -92,9 +92,9 @@ def test_batch_open_and_sweep(platform):
     assert platform.gates.count_open() == 0
 
 
-def test_cycle_reports_interlock_and_queue(platform):
+def test_cycle_reports_interlock_and_queue(platform, sign):
     platform.arrive("T01", "ST1", 0)
-    platform.enqueue("T01", "c1", "open", "ST1")
+    sign("door.enqueue", train_id="T01", kind="open", station_id="ST1")
     report = platform.cycle(dt=1.0)
     assert report["ok"] is True
     assert report["cycle"] == 1
@@ -129,6 +129,7 @@ def test_status_and_snapshot_cover_every_component(platform):
         "interlock",
         "gaps",
         "quota",
+        "sec",
         "store",
         "audit",
         "trend",
@@ -140,10 +141,10 @@ def test_status_and_snapshot_cover_every_component(platform):
     assert snapshot["timeline"]
 
 
-def test_misc_operations(platform):
+def test_misc_operations(platform, sign):
     assert platform.register_dwell("T01", 30.0, "ST1")["ok"] is True
     assert platform.assign_route("T01", "ST1", "ST2", 1500)["ok"] is True
-    assert platform.arm("T01", True)["armed"] is True
+    assert sign("interlock.arm", train_id="T01", armed=True)["armed"] is True
     assert platform.resolve_group("ST1", "G01")["group"] == "G01"
     platform.arrive("T01", "ST1", 0)
     error = platform.note_error(RailError("boom"))

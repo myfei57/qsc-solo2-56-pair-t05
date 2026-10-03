@@ -47,5 +47,9 @@ class ConfigError(RailError):
     """配置缺失或取值非法。"""
 
 
+class SecurityError(RailError):
+    """指令信封格式非法、验签失败或密钥状态不允许放行。"""
+
+
 class NamespaceError(RailError):
     """命名空间重复注册或解析失败。"""

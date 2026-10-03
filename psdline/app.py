@@ -46,6 +46,7 @@ from .ns import Namespace, NamespaceRegistry
 from .platform import MappingRegistry, adjacent, group_keys, physical_groups, resolve
 from .psd import LockoutRegistry, PSD, PSDRegistry, sweep_station
 from .quota import QuotaRegistry
+from .sec import CommandEnvelope, CommandGate, KeyRing, ReplayGuard
 from .sig import SignalController, aspect_of, depart_checked, refresh_position, signal_summary
 from .station import (
     DoorZone,
@@ -75,6 +76,16 @@ from .train import (
 
 ARRIVAL = "arrival"
 DEPART = "depart"
+
+# 受防伪闸门保护的指令类型：门控（排队、批量开门）与联锁（故障置位／解除、启用
+# 开关）。到发编排（arrive/depart）是平台自身的顺序控制，不在外部指令通道上。
+COMMAND_KINDS = (
+    "door.enqueue",
+    "door.batch_open",
+    "interlock.set_fault",
+    "interlock.clear_fault",
+    "interlock.arm",
+)
 
 
 class Platform:
@@ -133,6 +144,29 @@ class Platform:
             store, self.align, self.commands, self.gates, self.lockouts
         )
         self.doors.set_batch_limit(self.config.door.batch_limit)
+
+        self.keys = KeyRing(store)
+        self.replay = ReplayGuard(store)
+        self.command_gate = CommandGate(
+            self.keys,
+            self.replay,
+            self.clock,
+            self.audit,
+            self.bus,
+            kinds=COMMAND_KINDS,
+            max_ttl_s=self.config.sec.command_ttl_s,
+            clock_skew_s=self.config.sec.clock_skew_s,
+        )
+        self._executors = {
+            "door.enqueue": self._exec_door_enqueue,
+            "door.batch_open": self._exec_door_batch_open,
+            "interlock.set_fault": self._exec_set_fault,
+            "interlock.clear_fault": self._exec_clear_fault,
+            "interlock.arm": self._exec_arm,
+        }
+        key, generated = self.keys.ensure_active(self.clock.now())
+        if generated:
+            self.audit.record("sec_key_generated", "", "", kid=key.kid)
 
         self._cycles = 0
         self._operations = 0
@@ -548,14 +582,221 @@ class Platform:
             "violations": [],
         }
 
-    def enqueue(self, train_id: str, command_id: str, kind: str, station_id: str = "") -> dict:
-        """把一条门控指令排进队列。"""
+    # ---- 指令防伪 -----------------------------------------------------
 
-        command = enqueue(self.doors, train_id, command_id, kind, station_id)
-        self.audit.record(
-            "door_enqueue", train_id, station_id, command_id=command.id, command_kind=kind
+    def sign_command(self, kind: str, payload: dict, ttl_s: float | None = None) -> dict:
+        """用当前主密钥签一条指令信封。
+
+        仅供同信任域的运维工具与演示使用；HTTP 控制台不暴露签名能力，外部
+        发送方应持有自己的密钥副本离线签名。
+        """
+
+        if kind not in COMMAND_KINDS:
+            raise RailError(f"不支持的指令类型: {kind}", component="sec")
+        record = self.keys.active()
+        if record is None:
+            raise RailError("没有可用的主密钥", component="sec")
+        envelope = CommandEnvelope.mint(
+            self.ids.labeled("cmd"),
+            kind,
+            record.kid,
+            self.clock.now(),
+            ttl_s if ttl_s is not None else self.config.sec.command_ttl_s,
+            payload,
+            record.material_bytes(),
         )
+        return envelope.as_dict()
+
+    def submit_command(self, raw: dict) -> dict:
+        """验签后执行一条签名指令；验签失败直接丢弃并告警（不挂起）。"""
+
+        verdict = self.command_gate.submit(raw)
+        if not verdict.ok:
+            return {
+                "ok": False,
+                "violations": [verdict.reason],
+                "verdict": verdict.as_dict(),
+                "audit_id": verdict.audit_id,
+            }
+        envelope = verdict.envelope
+        try:
+            result = self._executors[envelope.kind](envelope)
+        except Exception:
+            # 部分失败回滚：执行器各自补偿（撤队、重锁、恢复开关）之后，这里
+            # 撤销重放认领，让发送方修正后能原样重试。
+            self.command_gate.release(envelope.id)
+            try:
+                self.audit.record(
+                    "command_rolled_back",
+                    "",
+                    "",
+                    command_id=envelope.id,
+                    command_kind=envelope.kind,
+                )
+            except Exception:
+                pass
+            raise
+        result["command_id"] = envelope.id
+        result["verdict"] = verdict.as_dict()
+        return result
+
+    def rotate_keys(self) -> dict:
+        """轮换指令签名密钥：旧钥进入宽限期（只验不签），生成新主密钥。"""
+
+        outcome = self.keys.rotate(self.clock.now(), self.config.sec.rotation_grace_s)
+        old = outcome["old"]
+        new = outcome["new"]
+        self.audit.record(
+            "sec_key_rotated",
+            "",
+            "",
+            old_kid=old.kid if old else "",
+            new_kid=new.kid,
+            grace_until=old.grace_until if old else 0.0,
+        )
+        for tombstone in outcome["retired"]:
+            self.audit.record("sec_key_retired", "", "", kid=tombstone.kid, at=tombstone.retired_at)
+        return {
+            "ok": True,
+            "old_kid": old.kid if old else "",
+            "new_kid": new.kid,
+            "grace_until": old.grace_until if old else 0.0,
+            "violations": [],
+        }
+
+    def sec_status(self) -> dict:
+        """返回防伪子系统状态（密钥只暴露元信息，不暴露材料）。"""
+
+        active = self.keys.active()
+        return {
+            "active_kid": active.kid if active else "",
+            "keys": [record.public_dict() for record in self.keys.list()],
+            "gate": self.command_gate.status(),
+            "command_ttl_s": self.config.sec.command_ttl_s,
+            "rotation_grace_s": self.config.sec.rotation_grace_s,
+        }
+
+    @staticmethod
+    def _payload_str(envelope: CommandEnvelope, key: str, required: bool = False) -> str:
+        """从信封载荷里取字符串字段。"""
+
+        value = envelope.payload.get(key, "")
+        if required and not str(value):
+            raise RailError(f"指令缺少字段 {key!r}", component="sec")
+        return str(value)
+
+    def _exec_door_enqueue(self, envelope: CommandEnvelope) -> dict:
+        """执行 door.enqueue：排队 → 审计；审计失败时撤队回滚。"""
+
+        train_id = self._payload_str(envelope, "train_id", required=True)
+        kind = str(envelope.payload.get("kind", "open"))
+        station_id = str(envelope.payload.get("station_id", ""))
+        command = enqueue(self.doors, train_id, envelope.id, kind, station_id, kid=envelope.kid)
+        try:
+            self.audit.record(
+                "door_enqueue",
+                train_id,
+                station_id,
+                command_id=command.id,
+                command_kind=kind,
+                kid=envelope.kid,
+            )
+        except Exception:
+            self.commands.retract(train_id, command.id)
+            raise
         return {"ok": True, "train_id": train_id, "command": command.as_dict(), "violations": []}
+
+    def _exec_door_batch_open(self, envelope: CommandEnvelope) -> dict:
+        """执行 door.batch_open；中途失败时整站关门回滚（关是安全方向）。"""
+
+        station_id = self._payload_str(envelope, "station_id", required=True)
+        layout = self.layouts.get(station_id)
+        zones = list(layout.zones) if layout else []
+        try:
+            outcome = batch_open(self.doors, station_id, zones)
+            nearest = nearest_zone(zones)
+            self.audit.record(
+                "batch_open",
+                "",
+                station_id,
+                opened=len(outcome["opened"]),
+                skipped=len(outcome["skipped"]),
+                command_id=envelope.id,
+                kid=envelope.kid,
+            )
+        except Exception:
+            sweep_station(self.gates, station_id)
+            raise
+        return {
+            "ok": not outcome["skipped"],
+            "station_id": station_id,
+            "order": outcome["order"],
+            "opened": outcome["opened"],
+            "deferred": outcome["deferred"],
+            "skipped": outcome["skipped"],
+            "nearest": nearest.id if nearest else "",
+            "violations": [],
+        }
+
+    def _exec_set_fault(self, envelope: CommandEnvelope) -> dict:
+        """执行 interlock.set_fault；审计失败不回滚（宁可多锁，不可少锁）。"""
+
+        psd_id = self._payload_str(envelope, "psd_id", required=True)
+        gate = self.gates.require(psd_id)
+        self.faults.set_fault(self.lockouts, psd_id, self.clock.now())
+        self.audit.record(
+            "interlock_fault",
+            "",
+            gate.station,
+            psd_id=psd_id,
+            command_id=envelope.id,
+            kid=envelope.kid,
+        )
+        return {"ok": True, "psd_id": psd_id, "locked": True, "violations": []}
+
+    def _exec_clear_fault(self, envelope: CommandEnvelope) -> dict:
+        """执行 interlock.clear_fault；审计失败时重新置位并锁定（回滚到安全侧）。"""
+
+        psd_id = self._payload_str(envelope, "psd_id", required=True)
+        gate = self.gates.require(psd_id)
+        allowed, reason = releasable(self.gates, psd_id, True)
+        if not allowed:
+            return {"ok": False, "psd_id": psd_id, "locked": True, "violations": [reason]}
+        self.faults.clear_fault(self.lockouts, psd_id, self.clock.now())
+        try:
+            self.audit.record(
+                "interlock_clear",
+                "",
+                gate.station,
+                psd_id=psd_id,
+                command_id=envelope.id,
+                kid=envelope.kid,
+            )
+        except Exception:
+            self.faults.set_fault(self.lockouts, psd_id, self.clock.now())
+            raise
+        return {"ok": True, "psd_id": psd_id, "locked": False, "violations": []}
+
+    def _exec_arm(self, envelope: CommandEnvelope) -> dict:
+        """执行 interlock.arm；审计失败时恢复原来的启用状态。"""
+
+        train_id = self._payload_str(envelope, "train_id", required=True)
+        armed = bool(envelope.payload.get("armed", True))
+        previous = self.armers.armed(train_id)
+        state = self.armers.arm(train_id, armed)
+        try:
+            self.audit.record(
+                "interlock_arm",
+                train_id,
+                "",
+                armed=state,
+                command_id=envelope.id,
+                kid=envelope.kid,
+            )
+        except Exception:
+            self.armers.arm(train_id, previous)
+            raise
+        return {"ok": True, "train_id": train_id, "armed": state, "violations": []}
 
     def process_queue(self, train_id: str) -> dict:
         """返回列车队列里待执行的门控指令，并带上发车自检结果。"""
@@ -570,32 +811,6 @@ class Platform:
             "ready": policy["allowed"],
             "violations": list(policy["failures"]),
         }
-
-    def clear_fault(self, psd_id: str) -> dict:
-        """清除门区故障并按条件解锁。"""
-
-        gate = self.gates.require(psd_id)
-        allowed, reason = releasable(self.gates, psd_id, True)
-        if not allowed:
-            return {"ok": False, "psd_id": psd_id, "locked": True, "violations": [reason]}
-        self.faults.clear_fault(self.lockouts, psd_id, self.clock.now())
-        self.audit.record("interlock_clear", "", gate.station, psd_id=psd_id)
-        return {"ok": True, "psd_id": psd_id, "locked": False, "violations": []}
-
-    def set_fault(self, psd_id: str) -> dict:
-        """置位门区故障并锁定。"""
-
-        gate = self.gates.require(psd_id)
-        self.faults.set_fault(self.lockouts, psd_id, self.clock.now())
-        self.audit.record("interlock_fault", "", gate.station, psd_id=psd_id)
-        return {"ok": True, "psd_id": psd_id, "locked": True, "violations": []}
-
-    def arm(self, train_id: str, armed: bool) -> dict:
-        """启用或退出一列车的联锁。"""
-
-        state = self.armers.arm(train_id, armed)
-        self.audit.record("interlock_arm", train_id, "", armed=state)
-        return {"ok": True, "train_id": train_id, "armed": state, "violations": []}
 
     def refresh_position(self, train_id: str, position_m: int) -> dict:
         """按信号刷新列车位置。"""
@@ -621,31 +836,6 @@ class Platform:
             advanced=verdict.advanced,
         )
         return {"ok": verdict.advanced, "verdict": verdict.as_dict(), "violations": [] if verdict.advanced else [verdict.reason]}
-
-    def batch_open(self, station_id: str) -> dict:
-        """按布局里程顺序批量开门。"""
-
-        layout = self.layouts.get(station_id)
-        zones = list(layout.zones) if layout else []
-        outcome = batch_open(self.doors, station_id, zones)
-        nearest = nearest_zone(zones)
-        self.audit.record(
-            "batch_open",
-            "",
-            station_id,
-            opened=len(outcome["opened"]),
-            skipped=len(outcome["skipped"]),
-        )
-        return {
-            "ok": not outcome["skipped"],
-            "station_id": station_id,
-            "order": outcome["order"],
-            "opened": outcome["opened"],
-            "deferred": outcome["deferred"],
-            "skipped": outcome["skipped"],
-            "nearest": nearest.id if nearest else "",
-            "violations": [],
-        }
 
     def sweep(self, station_id: str) -> dict:
         """整站清扫。"""
@@ -746,6 +936,7 @@ class Platform:
                 ARRIVAL: self.quotas.status(ARRIVAL),
                 DEPART: self.quotas.status(DEPART),
             },
+            "sec": self.sec_status(),
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
             "trend": self.trend.snapshot(limit=4),
