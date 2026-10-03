@@ -103,6 +103,27 @@ class AuditSection:
 
 
 @dataclass(frozen=True)
+class SecuritySection:
+    """指令防伪策略。
+
+    ``mode`` 三档：``enforce``（默认，验签失败即丢弃并告警）、``hold``（失败
+    指令进隔离区等人工接管，绝不执行）、``observe``（只记录不拦截，仅供灰度
+    期对账，严禁长期使用）。``rotate_overlap_s`` 是轮换后旧密钥仍可验签的并存
+    期；``command_ttl_s`` 是指令自签发起的有效期；``max_skew_s`` 是容忍的收发
+    时钟偏差。
+    """
+
+    mode: str = "enforce"
+    secrets_root: str = "var/secrets"
+    rotate_overlap_s: float = 86_400.0
+    command_ttl_s: float = 120.0
+    max_skew_s: float = 30.0
+    nonce_retention_s: float = 600.0
+    bootstrap: bool = True
+    failure_alarm_threshold: int = 5
+
+
+@dataclass(frozen=True)
 class ConsoleSection:
     """控制台监听地址。"""
 
@@ -124,6 +145,7 @@ class PlatformConfig:
     interlock: InterlockSection = field(default_factory=InterlockSection)
     quota: QuotaSection = field(default_factory=QuotaSection)
     audit: AuditSection = field(default_factory=AuditSection)
+    security: SecuritySection = field(default_factory=SecuritySection)
     console: ConsoleSection = field(default_factory=ConsoleSection)
 
     @property
@@ -169,6 +191,20 @@ class PlatformConfig:
             raise ConfigError("运行配额必须为正", component="config")
         if self.audit.journal_segment <= 0:
             raise ConfigError("审计分段长度必须为正", component="config")
+        if self.security.mode not in ("enforce", "hold", "observe"):
+            raise ConfigError("防伪模式必须是 enforce / hold / observe", component="config")
+        if not self.security.secrets_root:
+            raise ConfigError("密钥目录不能为空", component="config")
+        if self.security.rotate_overlap_s <= 0:
+            raise ConfigError("密钥并存期必须为正", component="config")
+        if self.security.command_ttl_s <= 0:
+            raise ConfigError("指令有效期必须为正", component="config")
+        if self.security.max_skew_s < 0:
+            raise ConfigError("时钟偏差容限不能为负", component="config")
+        if self.security.nonce_retention_s < self.security.command_ttl_s:
+            raise ConfigError("nonce 保留窗口不能短于指令有效期", component="config")
+        if self.security.failure_alarm_threshold <= 0:
+            raise ConfigError("告警失败阈值必须为正", component="config")
         if not 0 < self.console.port <= 65535:
             raise ConfigError("控制台端口必须落在 1..65535", component="config")
         return self
@@ -213,6 +249,7 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "interlock": dict(config.interlock.__dict__),
         "quota": dict(config.quota.__dict__),
         "audit": dict(config.audit.__dict__),
+        "security": dict(config.security.__dict__),
         "console": dict(config.console.__dict__),
     }
 
@@ -233,6 +270,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         interlock=_section(InterlockSection, payload.get("interlock")),
         quota=_section(QuotaSection, payload.get("quota")),
         audit=_section(AuditSection, payload.get("audit")),
+        security=_section(SecuritySection, payload.get("security")),
         console=_section(ConsoleSection, payload.get("console")),
     )
     return config.validate()

@@ -46,6 +46,15 @@ from .ns import Namespace, NamespaceRegistry
 from .platform import MappingRegistry, adjacent, group_keys, physical_groups, resolve
 from .psd import LockoutRegistry, PSD, PSDRegistry, sweep_station
 from .quota import QuotaRegistry
+from .security import (
+    ENFORCE,
+    Guard,
+    KeyRing,
+    NonceLedger,
+    Quarantine,
+    SecurityBoard,
+    Verifier,
+)
 from .sig import SignalController, aspect_of, depart_checked, refresh_position, signal_summary
 from .station import (
     DoorZone,
@@ -133,6 +142,47 @@ class Platform:
             store, self.align, self.commands, self.gates, self.lockouts
         )
         self.doors.set_batch_limit(self.config.door.batch_limit)
+
+        # ---- 指令防伪：密钥环 / nonce 台账 / 隔离区 / 告警牌 / 守卫 ----
+        security = self.config.security
+        self.keyring = KeyRing(
+            security.secrets_root,
+            overlap_s=security.rotate_overlap_s,
+            clock=self.clock,
+        )
+        if security.bootstrap and not self.keyring.has_any():
+            # 首次上线自动布一把 active 钥；正式部署应通过 `psdline keys ...`
+            # 把密钥登记到签发侧并妥善备份，bootstrap 仅保证服务不会裸奔。
+            self.keyring.bootstrap()
+        self.nonces = NonceLedger(
+            JsonlJournal(store.root, "nonces", segment_limit=self.config.audit.journal_segment),
+            retention_s=security.nonce_retention_s,
+        )
+        self.quarantine = Quarantine(
+            JsonlJournal(store.root, "quarantine", segment_limit=self.config.audit.journal_segment),
+            IdFactory("hold"),
+        )
+        self.board = SecurityBoard(self.bus, threshold=security.failure_alarm_threshold)
+        self.guard = Guard(
+            keyring=self.keyring,
+            nonces=self.nonces,
+            quarantine=self.quarantine,
+            board=self.board,
+            verifier=Verifier(
+                self.keyring,
+                self.nonces,
+                unit=self.unit,
+                ttl_s=security.command_ttl_s,
+                max_skew_s=security.max_skew_s,
+                clock=self.clock,
+            ),
+            audit=self.audit,
+            store=store,
+            clock=self.clock,
+            mode=security.mode,
+            checkpoint=self._telemetry_checkpoint,
+            restore=self._telemetry_restore,
+        )
 
         self._cycles = 0
         self._operations = 0
@@ -233,6 +283,40 @@ class Platform:
                 "line": self.namespace.line_id(),
             },
         )
+
+    # 事务回滚时需要恢复的纯遥测内存计数。落盘态由 JsonStore 事务权威恢复，
+    # 这些计数器只影响状态接口读数；审计/事件/nonce 是只追加流水，按设计不回滚。
+    _TELEMETRY = (
+        ("faults", "_sets"),
+        ("faults", "_clears"),
+        ("armers", "_arms"),
+        ("armers", "_disarms"),
+        ("signals", "_raises"),
+        ("signals", "_clears"),
+        ("commands", "_epoch"),
+        ("doors", "_opens"),
+        ("doors", "_closes"),
+        ("mappings", "_rewrites"),
+        ("gaps", "_checks"),
+        ("gaps", "_probes"),
+        ("lockouts", "_changes"),
+    )
+
+    def _telemetry_checkpoint(self) -> dict:
+        """拍一张各组件遥测计数快照（与存储事务配对，异常时据此恢复）。"""
+
+        return {
+            name: int(getattr(getattr(self, name), attr))
+            for name, attr in self._TELEMETRY
+        } | {"_operations": self._operations, "_cycles": self._cycles}
+
+    def _telemetry_restore(self, token: dict) -> None:
+        """把遥测计数恢复成执行前快照。"""
+
+        for name, attr in self._TELEMETRY:
+            setattr(getattr(self, name), attr, int(token[name]))
+        self._operations = int(token["_operations"])
+        self._cycles = int(token["_cycles"])
 
     def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
         """把编排步骤逐条写事件，并记一条汇总审计。"""
@@ -551,9 +635,13 @@ class Platform:
     def enqueue(self, train_id: str, command_id: str, kind: str, station_id: str = "") -> dict:
         """把一条门控指令排进队列。"""
 
-        command = enqueue(self.doors, train_id, command_id, kind, station_id)
+        auth_id = self.audit.current_auth()
+        command = enqueue(
+            self.doors, train_id, command_id, kind, station_id, auth_id=auth_id
+        )
         self.audit.record(
-            "door_enqueue", train_id, station_id, command_id=command.id, command_kind=kind
+            "door_enqueue", train_id, station_id, command_id=command.id,
+            command_kind=kind,
         )
         return {"ok": True, "train_id": train_id, "command": command.as_dict(), "violations": []}
 
@@ -748,6 +836,7 @@ class Platform:
             },
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
+            "security": self.security_status(),
             "trend": self.trend.snapshot(limit=4),
             "ids_issued": self.ids.issued(),
         }
@@ -840,6 +929,136 @@ class Platform:
         if not self.store.exists("platform/state"):
             return False
         return self.store.remove("platform/state")
+
+    # ---- 指令防伪管理 -------------------------------------------------
+
+    def security_status(self) -> dict:
+        """汇总防伪子系统状态：密钥环、nonce 台账、隔离区、告警牌、守卫计数。"""
+
+        self.keyring.retire_expired(self.clock.now())
+        return {
+            "mode": self.guard.mode,
+            "keys": self.keyring.describe(),
+            "active_kid": self.keyring.active().kid if self.keyring.active() else "",
+            "nonces": {
+                "active": self.nonces.active_count(),
+                "consumed_total": self.nonces.consumed_total(),
+                "retention_s": self.nonces.retention_s,
+            },
+            "quarantine": self.quarantine.counts(),
+            "board": self.board.snapshot(),
+            "guard": self.guard.counts(),
+        }
+
+    def rotate_keys(self, secret: str | None = None) -> dict:
+        """轮换签名密钥：旧 active 进 grace 并存期，新 active 立即生效。"""
+
+        fresh, old = self.keyring.rotate(secret, now=self.clock.now())
+        self.audit.record(
+            "key_rotated",
+            "",
+            "",
+            self.clock.now(),
+            severity="alarm",
+            new_kid=fresh.kid,
+            old_kid=old.kid if old else "",
+            retire_at=old.retire_at if old else 0,
+            fingerprint=fresh.fingerprint,
+        )
+        return {
+            "ok": True,
+            "active_kid": fresh.kid,
+            "fingerprint": fresh.fingerprint,
+            "grace_kid": old.kid if old else "",
+            "retire_at": old.retire_at if old else 0,
+            "violations": [],
+        }
+
+    def revoke_key(self, kid: str) -> dict:
+        """立即吊销一把密钥并擦除其材料。"""
+
+        record = self.keyring.revoke(kid, now=self.clock.now())
+        self.audit.record(
+            "key_revoked",
+            "",
+            "",
+            self.clock.now(),
+            severity="alarm",
+            kid=kid,
+            fingerprint=record.fingerprint,
+        )
+        return {"ok": True, "kid": kid, "state": record.state, "violations": []}
+
+    def retire_keys(self) -> dict:
+        """把并存期到期的 grace 钥退役（擦除材料、保留墓碑）。"""
+
+        kids = self.keyring.retire_expired(self.clock.now())
+        if kids:
+            self.audit.record(
+                "keys_retired", "", "", self.clock.now(), kids=kids,
+            )
+        return {"ok": True, "retired": kids, "violations": []}
+
+    def list_quarantine(self, pending_only: bool = False) -> dict:
+        """列出隔离区里的可疑指令（默认全部；``pending_only`` 只看待处置）。"""
+
+        items = self.quarantine.pending() if pending_only else self.quarantine.list()
+        return {
+            "holds": [item.as_dict() for item in items],
+            "counts": self.quarantine.counts(),
+        }
+
+    def dismiss_hold(self, hold_id: str, *, by: str = "", note: str = "") -> dict:
+        """确认伪造：丢弃挂起指令并保留证据。"""
+
+        held = self.quarantine.get(hold_id)
+        if held is None:
+            return {"ok": False, "violations": [f"隔离记录不存在: {hold_id}"]}
+        resolved = self.quarantine.resolve(
+            hold_id, "dismissed", at=self.clock.now(), by=by, note=note
+        )
+        self.audit.record(
+            "hold_dismissed", "", "", self.clock.now(), severity="alarm",
+            hold_id=hold_id, reason=held.reason, by=by,
+        )
+        return {"ok": True, "hold_id": hold_id, "status": resolved.status, "violations": []}
+
+    def mark_hold_reissued(self, hold_id: str, *, by: str = "", note: str = "") -> dict:
+        """标记挂起指令已由值班员用自己的新签名重新签发（原报文不执行）。"""
+
+        held = self.quarantine.get(hold_id)
+        if held is None:
+            return {"ok": False, "violations": [f"隔离记录不存在: {hold_id}"]}
+        resolved = self.quarantine.resolve(
+            hold_id, "reissued", at=self.clock.now(), by=by, note=note
+        )
+        self.audit.record(
+            "hold_reissued", "", "", self.clock.now(), severity="alarm",
+            hold_id=hold_id, reason=held.reason, by=by,
+        )
+        return {"ok": True, "hold_id": hold_id, "status": resolved.status, "violations": []}
+
+    def reset_security_alarm(self, *, by: str = "") -> dict:
+        """人工清除安全告警牌。"""
+
+        result = self.board.reset(at=self.clock.now(), by=by)
+        return {"ok": True, **result, "violations": []}
+
+    def set_security_mode(self, mode: str) -> dict:
+        """切换防伪模式（enforce/hold/observe），切换动作记入审计。"""
+
+        current = self.guard.mode
+        resolved = self.guard.set_mode(mode)
+        self.audit.record(
+            "security_mode_changed",
+            "",
+            "",
+            self.clock.now(),
+            severity="alarm" if resolved != "enforce" else "notice",
+            previous=current,
+            current=resolved,
+        )
+        return {"ok": True, "mode": resolved, "previous": current, "violations": []}
 
     # ---- 内部 ---------------------------------------------------------
 

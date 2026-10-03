@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import threading
 
 from ..clock import Clock
 from ..errors import RailError
@@ -10,6 +12,11 @@ from ..eventbus import Event, EventBus
 from ..ids import IdFactory
 from ..store import JsonlJournal
 from .entry import AuditEntry
+
+# 当前指令作用域内的验签凭据标识；该指令链路上所有审计条目的 detail 都会
+# 带上同一个 auth_id，事后可按凭据把"验签结论→联锁→门控动作"串成一条线。
+_CURRENT_AUTH = threading.local()
+_RESERVED_DETAIL = frozenset({"severity", "auth_id"})
 
 
 class AuditLog:
@@ -36,19 +43,35 @@ class AuditLog:
         train_id: str,
         station_id: str,
         at: float | None = None,
+        severity: str = "notice",
         **detail: object,
     ) -> AuditEntry:
-        """写入一条审计流水。"""
+        """写入一条审计流水。
+
+        ``severity`` 为 ``alarm`` 时事件总线以告警级别投递；处于 :meth:`scope`
+        作用域内时 ``auth_id`` 自动并入明细（显式传入优先），让一条指令的
+        "验签结论 → 联锁/门控动作 → 回滚补偿"在审计里能用同一凭据串起来。
+        """
 
         if not kind:
             raise RailError("审计动作类型为空", component="audit")
+        auth_id = detail.get("auth_id") or getattr(_CURRENT_AUTH, "id", "")
+        clean = {
+            key: value
+            for key, value in detail.items()
+            if value is not None and key not in _RESERVED_DETAIL
+        }
+        if auth_id:
+            clean["auth_id"] = str(auth_id)
+        if severity:
+            clean["severity"] = severity
         entry = AuditEntry(
             id=self._ids.next(),
             kind=kind,
             train_id=train_id,
             station_id=station_id,
             at=self._clock.now() if at is None else at,
-            detail={key: value for key, value in detail.items() if value is not None},
+            detail=clean,
         )
         self._journal.append(entry.as_dict())
         self._index.append(entry)
@@ -57,12 +80,30 @@ class AuditLog:
                 "audit",
                 "audit",
                 kind,
-                severity="notice",
+                severity=severity or "notice",
                 train_id=train_id,
                 station_id=station_id,
+                auth_id=str(auth_id or ""),
             )
         )
         return entry
+
+    @contextlib.contextmanager
+    def scope(self, auth_id: str):
+        """把一个验签凭据标识绑定到当前线程的后续审计写入。"""
+
+        previous = getattr(_CURRENT_AUTH, "id", "")
+        _CURRENT_AUTH.id = auth_id
+        try:
+            yield
+        finally:
+            _CURRENT_AUTH.id = previous
+
+    @staticmethod
+    def current_auth() -> str:
+        """返回当前线程绑定的验签凭据标识（未处于指令作用域时为空串）。"""
+
+        return getattr(_CURRENT_AUTH, "id", "")
 
     def list(self) -> list[AuditEntry]:
         """返回内存里保留的审计条目。"""

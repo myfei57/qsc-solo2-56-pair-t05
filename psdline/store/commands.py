@@ -21,15 +21,19 @@ class DoorCommand:
     kind: str
     epoch: int
     station_id: str = ""
+    auth_id: str = ""
 
     def as_dict(self) -> dict:
-        return {
+        data = {
             "id": self.id,
             "train_id": self.train_id,
             "kind": self.kind,
             "epoch": self.epoch,
             "station_id": self.station_id,
         }
+        if self.auth_id:
+            data["auth_id"] = self.auth_id
+        return data
 
     @classmethod
     def from_dict(cls, payload: dict) -> "DoorCommand":
@@ -39,6 +43,7 @@ class DoorCommand:
             kind=str(payload.get("kind", "")),
             epoch=int(payload.get("epoch", 0)),
             station_id=str(payload.get("station_id", "")),
+            auth_id=str(payload.get("auth_id", "")),
         )
 
 

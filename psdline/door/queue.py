@@ -20,6 +20,7 @@ def enqueue(
     command_id: str,
     kind: str,
     station_id: str,
+    auth_id: str = "",
 ) -> DoorCommand:
     """把一条门控指令排进列车队列。"""
 
@@ -29,6 +30,7 @@ def enqueue(
         kind=kind,
         epoch=controller.commands.epoch,
         station_id=station_id,
+        auth_id=auth_id,
     )
     controller.commands.append(command)
     return command

@@ -64,39 +64,36 @@ def test_api_mapping_and_resolve(platform):
     assert status == 409
 
 
-def test_api_action_flow(platform):
-    api = Api(platform)
-    status, arrival = api.handle(
-        "POST", "/api/arrive", {}, {"train_id": "T01", "station_id": "ST1", "position_m": 0}
-    )
+def test_api_action_flow(platform, signed_post):
+    status, arrival = signed_post("/api/arrive", {"train_id": "T01", "station_id": "ST1", "position_m": 0})
     assert status == 200 and arrival["ok"] is True
-    status, gap = api.handle("POST", "/api/gap", {}, {"train_id": "T01"})
+    assert arrival["auth_id"]
+    status, gap = signed_post("/api/gap", {"train_id": "T01"})
     assert status == 200 and gap["clear"] is True
-    status, queued = api.handle(
-        "POST", "/api/enqueue", {}, {"train_id": "T01", "id": "c1", "kind": "open", "station_id": "ST1"}
+    status, queued = signed_post(
+        "/api/enqueue", {"train_id": "T01", "id": "c1", "kind": "open", "station_id": "ST1"}
     )
     assert status == 200
-    status, processed = api.handle("POST", "/api/process", {}, {"train_id": "T01"})
+    # 排队指令带上它自己那条签名指令的验签凭据，可回溯到验签结论。
+    assert queued["command"]["auth_id"].startswith("auth-")
+    status, processed = signed_post("/api/process", {"train_id": "T01"})
     assert status == 200 and processed["ids"] == ["c1"] and processed["ready"] is False
-    status, departure = api.handle(
-        "POST", "/api/depart", {}, {"train_id": "T01", "station_id": "ST1"}
-    )
+    status, departure = signed_post("/api/depart", {"train_id": "T01", "station_id": "ST1"})
     assert status == 200 and departure["ok"] is True
 
 
-def test_api_rejects_missing_and_bad_fields(platform):
-    api = Api(platform)
-    status, payload = api.handle("POST", "/api/arrive", {}, {"station_id": "ST1"})
+def test_api_rejects_missing_and_bad_fields(platform, signed_post):
+    status, payload = signed_post("/api/arrive", {"station_id": "ST1"})
     assert status == 400
     assert payload["component"] == "console"
-    status, payload = api.handle("POST", "/api/cycle", {}, {"dt": "abc"})
+    status, payload = signed_post("/api/cycle", {"dt": "abc"})
     assert status == 400
     assert payload["error"] == "RailError"
-    status, payload = api.handle("POST", "/api/renumber", {}, {"station_id": "ST1"})
-    assert status == 400
-    status, payload = api.handle(
-        "POST", "/api/renumber", {}, {"station_id": "ST1", "groups": {"A": "G01"}}
-    )
+    # 完全没有签名信封的裸报文在守卫处即被拒，到不了字段校验。
+    api = Api(platform)
+    status, payload = api.handle("POST", "/api/arrive", {}, {"station_id": "ST1"})
+    assert status == 401 and payload["reason"] == "malformed"
+    status, payload = signed_post("/api/renumber", {"station_id": "ST1", "groups": {"A": "G01"}})
     assert status == 200
 
 

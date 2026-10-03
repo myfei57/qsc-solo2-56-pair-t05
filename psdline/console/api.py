@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from ..app import Platform
-from ..audit import build_timeline
+from ..audit import build_timeline, by_auth, verification_verdicts
 from ..errors import RailError
 from .router import Router
 
@@ -41,7 +41,13 @@ def _as_float(body: dict, key: str, default: float) -> float:
 
 
 class Api:
-    """把 HTTP 请求翻译成平台调用。"""
+    """把 HTTP 请求翻译成平台调用。
+
+    查询类 GET 不走防伪闸门（只读、不改现场）；所有动作类 POST 都必须是签名
+    信封，由 :class:`~psdline.security.Guard` 先验签、消费 nonce，再在存储事务
+    内调用平台方法。平台方法的直接调用（CLI、测试、内部周期）仍是可信本地
+    调用——信任边界画在"外部网络指令"这一层。
+    """
 
     def __init__(self, platform: Platform) -> None:
         self._platform = platform
@@ -67,7 +73,11 @@ class Api:
         add("GET", "/api/interlock", lambda params, body: self._platform.status()["interlock"])
         add("GET", "/api/gaps", lambda params, body: self._platform.status()["gaps"])
         add("GET", "/api/quota", lambda params, body: self._platform.status()["quota"])
+        add("GET", "/api/security", lambda params, body: self._platform.security_status())
+        add("GET", "/api/quarantine", self._quarantine_list)
         add("GET", "/api/audit", self._audit)
+        add("GET", "/api/audit/auth/{authID}", self._audit_chain)
+        add("GET", "/api/audit/verdicts", self._audit_verdicts)
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/trend", self._trend)
         add("GET", "/api/store", self._store)
@@ -91,22 +101,54 @@ class Api:
         add("POST", "/api/dwell", self._dwell)
         add("POST", "/api/route", self._route)
         add("POST", "/api/reset-state", self._reset_state)
+        add("POST", "/api/security/rotate", self._key_rotate)
+        add("POST", "/api/security/revoke", self._key_revoke)
+        add("POST", "/api/security/retire", self._key_retire)
+        add("POST", "/api/security/mode", self._security_mode)
+        add("POST", "/api/security/reset-alarm", self._security_reset)
+        add("POST", "/api/quarantine/dismiss", self._hold_dismiss)
+        add("POST", "/api/quarantine/reissued", self._hold_reissued)
 
     def routes(self) -> list[dict]:
         """返回接口清单，供自检与文档核对。"""
 
         return [route.as_dict() for route in self._router.routes()]
 
-    def handle(self, method: str, path: str, query: dict, body: dict) -> tuple[int, dict]:
-        """处理一次请求，返回状态码与响应体。"""
+    def handle(
+        self,
+        method: str,
+        path: str,
+        query: dict,
+        body: dict,
+        *,
+        source: str = "",
+        signed: bool = True,
+    ) -> tuple[int, dict]:
+        """处理一次请求，返回状态码与响应体。
+
+        POST 动作统一进守卫验签（``signed=False`` 仅用于本机可信调用/灰度
+        对照测试）；GET 查询沿用直接派发。
+        """
 
         matched = self._router.match(method, path)
         if matched is None:
             return 404, {"error": "not_found", "path": path}
         handler, params = matched
         merged = {**query, **params}
+
+        def invoke(payload: dict) -> dict:
+            return handler(merged, payload)
+
+        if method.upper() == "POST" and signed:
+            try:
+                return self._platform.guard.execute(body, path, invoke, source=source)
+            except RailError as error:
+                self._platform.note_error(error)
+                status = 409 if error.component != "console" else 400
+                return status, {"error": type(error).__name__, **error.as_record()}
+
         try:
-            payload = handler(merged, body)
+            payload = invoke(body)
         except RailError as error:
             self._platform.note_error(error)
             status = 409 if error.component != "console" else 400
@@ -140,6 +182,22 @@ class Api:
             "entries": [entry.as_dict() for entry in entries[-int(params.get("limit", 50)) :]],
             "summary": self._platform.audit.summary(),
         }
+
+    def _audit_chain(self, params: dict, body: dict) -> dict:
+        auth_id = str(params.get("authID", ""))
+        entries = by_auth(self._platform.audit.list(), auth_id)
+        if not entries:
+            raise RailError(f"没有凭据 {auth_id} 的审计链路", component="console")
+        return {
+            "auth_id": auth_id,
+            "entries": [entry.as_dict() for entry in entries],
+            "kinds": [entry.kind for entry in entries],
+        }
+
+    def _audit_verdicts(self, params: dict, body: dict) -> dict:
+        limit = int(params.get("limit", 50))
+        entries = verification_verdicts(self._platform.audit.list())[-limit:]
+        return {"verdicts": [entry.as_dict() for entry in entries]}
 
     def _timeline(self, params: dict, body: dict) -> dict:
         train_id = str(params.get("train_id", ""))
@@ -264,3 +322,39 @@ class Api:
 
     def _reset_state(self, params: dict, body: dict) -> dict:
         return {"removed": self._platform.reset_state()}
+
+    # ---- 防伪管理（这些接口本身同样需要签名信封） ---------------------
+
+    def _quarantine_list(self, params: dict, body: dict) -> dict:
+        pending_only = str(params.get("pending", "")).lower() in ("1", "true", "yes")
+        return self._platform.list_quarantine(pending_only)
+
+    def _key_rotate(self, params: dict, body: dict) -> dict:
+        secret = body.get("secret")
+        return self._platform.rotate_keys(str(secret) if secret else None)
+
+    def _key_revoke(self, params: dict, body: dict) -> dict:
+        return self._platform.revoke_key(_require(body, "kid"))
+
+    def _key_retire(self, params: dict, body: dict) -> dict:
+        return self._platform.retire_keys()
+
+    def _security_reset(self, params: dict, body: dict) -> dict:
+        return self._platform.reset_security_alarm(by=str(body.get("by", "")))
+
+    def _security_mode(self, params: dict, body: dict) -> dict:
+        return self._platform.set_security_mode(_require(body, "mode"))
+
+    def _hold_dismiss(self, params: dict, body: dict) -> dict:
+        return self._platform.dismiss_hold(
+            _require(body, "hold_id"),
+            by=str(body.get("by", "")),
+            note=str(body.get("note", "")),
+        )
+
+    def _hold_reissued(self, params: dict, body: dict) -> dict:
+        return self._platform.mark_hold_reissued(
+            _require(body, "hold_id"),
+            by=str(body.get("by", "")),
+            note=str(body.get("note", "")),
+        )

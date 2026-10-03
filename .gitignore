@@ -6,6 +6,11 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 var/
+# 密钥材料（共享密钥）任何情况下都不得入库
+secrets/
+*.key
+*.secret
+*.hmac
 
 # 虚拟环境
 .venv/

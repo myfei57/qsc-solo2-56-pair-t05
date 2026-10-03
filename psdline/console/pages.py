@@ -168,7 +168,45 @@ def _alarm_page(platform: Platform) -> str:
     status = platform.status()
     interlock = status["interlock"]
     audit = status["audit"]
+    security = status["security"]
+    board = security["board"]
     body = _table(
+        "指令防伪",
+        [
+            ("防伪模式", security["mode"]),
+            ("当前签名密钥", security["active_kid"] or "（无）"),
+            ("安全告警", "已立牌" if board["alarm_active"] else "正常"),
+            ("验签失败累计", board["failures"]),
+            ("放行 / 执行 / 回滚", f"{security['guard']['accepted']} / {security['guard']['executed']} / {security['guard']['rolled_back']}"),
+            ("已消费 nonce", f"{security['nonces']['active']}（累计 {security['nonces']['consumed_total']}）"),
+            (
+                "隔离区",
+                f"待处置 {security['quarantine']['pending']} / "
+                f"已丢弃 {security['quarantine']['dismissed']} / 已重签 {security['quarantine']['reissued']}",
+            ),
+        ],
+    )
+    body += _table(
+        "密钥环",
+        [
+            (
+                item["kid"],
+                f"{item['state']} 指纹 {item['fingerprint'][:12]}"
+                + (f" 并存期至 {item['retire_at']:.0f}" if item.get("retire_at") else ""),
+            )
+            for item in security["keys"]
+        ]
+        or [("暂无", "-")],
+    )
+    if board["recent"]:
+        body += _table(
+            "最近验签失败",
+            [
+                (str(item.get("at", "")), f"{item.get('reason', '')} 来源 {item.get('source', '')}")
+                for item in reversed(board["recent"][-8:])
+            ],
+        )
+    body += _table(
         "联锁与故障",
         [
             ("活动故障", ", ".join(interlock["faults_active"]) or "-"),

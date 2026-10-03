@@ -47,6 +47,16 @@
   "audit": {
     "journal_segment": 512
   },
+  "security": {
+    "mode": "enforce",
+    "secrets_root": "var/secrets",
+    "rotate_overlap_s": 86400.0,
+    "command_ttl_s": 120.0,
+    "max_skew_s": 30.0,
+    "nonce_retention_s": 600.0,
+    "bootstrap": true,
+    "failure_alarm_threshold": 5
+  },
   "console": {
     "host": "127.0.0.1",
     "port": 8080

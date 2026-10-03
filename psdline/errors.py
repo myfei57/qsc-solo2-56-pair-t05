@@ -49,3 +49,20 @@ class ConfigError(RailError):
 
 class NamespaceError(RailError):
     """命名空间重复注册或解析失败。"""
+
+
+class SecurityError(RailError):
+    """指令防伪拒绝（验签失败、过期、重放、密钥失效等）。
+
+    ``reason`` 是稳定的机器可读判定码（见 :mod:`psdline.security.guard`），
+    供审计统计与告警阈值判定；不随文案改动而变。
+    """
+
+    def __init__(self, message: str, *, reason: str = "rejected", component: str = "security") -> None:
+        super().__init__(message, component=component)
+        self.reason = reason
+
+    def as_record(self) -> dict:
+        record = super().as_record()
+        record["reason"] = self.reason
+        return record

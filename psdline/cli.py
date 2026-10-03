@@ -24,6 +24,7 @@ from .clock import ManualClock, SystemClock
 from .config import config_to_mapping, default_config, load_config
 from .console.server import ConsoleServer, probe_endpoints
 from .errors import RailError
+from .security import Signer
 
 DEFAULT_PROBE_PATHS = ("/api/status", "/api/readiness", "/api/stations", "/", "/alarms")
 
@@ -90,7 +91,15 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     # 演示自检用临时端口，避免和本机常驻服务抢 8080。
     server = ConsoleServer(platform, port=0)
     base_url = server.start()
-    probe = probe_endpoints(base_url, list(DEFAULT_PROBE_PATHS))
+    probe_signer = Signer(
+        platform.keyring.active().secret,
+        platform.keyring.active().kid,
+        unit=platform.unit,
+        clock=clock,
+    )
+    probe = probe_endpoints(
+        base_url, list(DEFAULT_PROBE_PATHS) + ["/api/cycle"], signer=probe_signer
+    )
     server.stop()
 
     report = {
@@ -182,6 +191,109 @@ def _cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---- 指令防伪：密钥管理与签名 -----------------------------------------
+
+
+def _keyring(args: argparse.Namespace):
+    config = load_config(args.config) if getattr(args, "config", None) else default_config()
+    from .security import KeyRing
+
+    ring = KeyRing(
+        config.security.secrets_root,
+        overlap_s=config.security.rotate_overlap_s,
+        clock=SystemClock(),
+    )
+    return config, ring
+
+
+def _cmd_keys_list(args: argparse.Namespace) -> int:
+    _config, ring = _keyring(args)
+    ring.retire_expired()
+    _dump({"keys": ring.describe()})
+    return 0
+
+
+def _cmd_keys_bootstrap(args: argparse.Namespace) -> int:
+    config, ring = _keyring(args)
+    record = ring.bootstrap()
+    _dump(
+        {
+            "kid": record.kid,
+            "state": record.state,
+            "fingerprint": record.fingerprint,
+            "secret": record.secret if args.show_secret else None,
+            "unit": config.platform.unit,
+        }
+    )
+    if not args.show_secret:
+        print("提示：密钥只显示一次，需要带出请加 --show-secret", file=sys.stderr)
+    return 0
+
+
+def _cmd_keys_rotate(args: argparse.Namespace) -> int:
+    config, ring = _keyring(args)
+    fresh, old = ring.rotate()
+    _dump(
+        {
+            "active_kid": fresh.kid,
+            "fingerprint": fresh.fingerprint,
+            "secret": fresh.secret if args.show_secret else None,
+            "grace_kid": old.kid if old else None,
+            "retire_at": old.retire_at if old else None,
+            "overlap_s": config.security.rotate_overlap_s,
+            "unit": config.platform.unit,
+        }
+    )
+    if not args.show_secret:
+        print("提示：新密钥只显示一次，需要带出请加 --show-secret", file=sys.stderr)
+    return 0
+
+
+def _cmd_keys_revoke(args: argparse.Namespace) -> int:
+    _config, ring = _keyring(args)
+    record = ring.revoke(args.kid)
+    _dump({"kid": args.kid, "state": record.state, "fingerprint": record.fingerprint})
+    return 0
+
+
+def _cmd_keys_retire(args: argparse.Namespace) -> int:
+    _config, ring = _keyring(args)
+    kids = ring.retire_expired()
+    _dump({"retired": kids})
+    return 0
+
+
+def _cmd_sign(args: argparse.Namespace) -> int:
+    config, ring = _keyring(args)
+    if args.kid:
+        record = ring.get(args.kid)
+        if record is None:
+            print(json.dumps({"error": "unknown_kid", "kid": args.kid}), file=sys.stderr)
+            return 2
+    else:
+        record = ring.active()
+        if record is None:
+            print(json.dumps({"error": "no_active_key"}), file=sys.stderr)
+            return 2
+    if not record.secret:
+        print(json.dumps({"error": "key_not_usable", "kid": record.kid, "state": record.state}), file=sys.stderr)
+        return 2
+    try:
+        body = json.loads(args.body) if args.body else {}
+    except json.JSONDecodeError as error:
+        print(json.dumps({"error": "bad_body", "message": str(error)}), file=sys.stderr)
+        return 2
+    signer = Signer(
+        record.secret,
+        record.kid,
+        unit=args.unit or config.platform.unit,
+        ttl_s=args.ttl or config.security.command_ttl_s,
+    )
+    envelope = signer.envelope(args.action, body)
+    _dump(envelope)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行解析器。"""
 
@@ -216,6 +328,30 @@ def build_parser() -> argparse.ArgumentParser:
 
     reset = sub.add_parser("reset", help="清掉落盘的平台计数", parents=[common])
     reset.set_defaults(func=_cmd_reset)
+
+    keys = sub.add_parser("keys", help="签名密钥管理", parents=[common])
+    key_sub = keys.add_subparsers(dest="key_command", required=True)
+    key_list = key_sub.add_parser("list", help="列出密钥环（不含密钥材料）", parents=[common])
+    key_list.set_defaults(func=_cmd_keys_list)
+    key_boot = key_sub.add_parser("bootstrap", help="首次布防：生成第一把 active 钥", parents=[common])
+    key_boot.add_argument("--show-secret", action="store_true", help="打印密钥明文（仅此一次）")
+    key_boot.set_defaults(func=_cmd_keys_bootstrap)
+    key_rotate = key_sub.add_parser("rotate", help="轮换：旧 active 进并存期，生成新 active", parents=[common])
+    key_rotate.add_argument("--show-secret", action="store_true", help="打印新密钥明文")
+    key_rotate.set_defaults(func=_cmd_keys_rotate)
+    key_revoke = key_sub.add_parser("revoke", help="立即吊销一把密钥", parents=[common])
+    key_revoke.add_argument("--kid", required=True)
+    key_revoke.set_defaults(func=_cmd_keys_revoke)
+    key_retire = key_sub.add_parser("retire", help="退役并存期到期的旧钥", parents=[common])
+    key_retire.set_defaults(func=_cmd_keys_retire)
+
+    sign = sub.add_parser("sign", help="用 active 密钥签发一条指令信封", parents=[common])
+    sign.add_argument("--action", required=True, help="授权接口路径，如 /api/arrive")
+    sign.add_argument("--body", help="接口正文 JSON 字符串，缺省为空对象")
+    sign.add_argument("--kid", help="指定密钥，缺省用当前 active")
+    sign.add_argument("--unit", help="覆盖运行单元，缺省取配置里的 unit")
+    sign.add_argument("--ttl", type=float, help="覆盖有效期秒数")
+    sign.set_defaults(func=_cmd_sign)
     return parser
 
 

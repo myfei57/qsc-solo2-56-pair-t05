@@ -52,7 +52,13 @@ class _Handler(BaseHTTPRequestHandler):
                 self._respond(200, page.encode("utf-8"), "text/html; charset=utf-8")
                 return
 
-        status, payload = self.server.api.handle(method, parsed.path, query, body)  # type: ignore[attr-defined]
+        status, payload = self.server.api.handle(  # type: ignore[attr-defined]
+            method,
+            parsed.path,
+            query,
+            body,
+            source=self.client_address[0] if self.client_address else "",
+        )
         self._respond(
             status,
             json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8"),
@@ -134,14 +140,21 @@ class ConsoleServer:
         self._thread = None
 
 
-def probe_endpoints(base_url: str, paths: list[str]) -> dict:
-    """对控制台各接口发真实 HTTP 请求，返回每个路径的健康结果。"""
+def probe_endpoints(base_url: str, paths: list[str], *, signer=None) -> dict:
+    """对控制台各接口发真实 HTTP 请求，返回每个路径的健康结果。
+
+    传入 :class:`~psdline.security.Signer` 时，``/api/...`` 的 POST 探测会
+    自动带签名信封（例如 ``/api/cycle``），用于验证守卫链路在线。
+    """
 
     results: dict[str, dict] = {}
     for path in paths:
         url = f"{base_url}{path}"
         try:
-            with urllib.request.urlopen(url, timeout=5) as response:
+            data = None
+            if signer is not None and path == "/api/cycle":
+                data = signer.sealed(path, {"dt": 1.0})
+            with urllib.request.urlopen(url, data=data, timeout=5) as response:
                 raw = response.read().decode("utf-8")
                 if path.startswith("/api") or "json" in response.headers.get("Content-Type", ""):
                     payload = json.loads(raw)
@@ -149,6 +162,8 @@ def probe_endpoints(base_url: str, paths: list[str]) -> dict:
                 else:
                     keys = ["<html>"] if raw.lstrip().startswith("<!doctype html") else ["<text>"]
                 results[path] = {"ok": response.status == 200, "status": response.status, "keys": keys}
+        except urllib.error.HTTPError as error:
+            results[path] = {"ok": False, "status": error.code, "error": error.reason}
         except (urllib.error.URLError, OSError, json.JSONDecodeError) as error:
             results[path] = {"ok": False, "error": str(error)}
     return results
